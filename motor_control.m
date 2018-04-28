@@ -1,4 +1,4 @@
-function [hist,sim]=motor_control()
+function [hist_log,sim]=motor_control()
 
 mp = motor_params(1000,   % torque constant
                   0.5,    % rotor inertia
@@ -41,36 +41,39 @@ hist_log = struct('state',zeros(floor(sim.end_t/sim.dt),3+1),... [current, rate,
               'pwm',zeros(floor(sim.end_t*sim.ctrl.set_speed_hz*sim.ep.num_ticks),2+1),... [coarse, fine]
               'pwm_idx',1);
 
+next_t_print = 0; % next time to print sim status
 while sim.t < sim.end_t
 
   sim = prop_sim(sim);
+  if sim.t >= next_t_print
+    fprintf('t=%.0f\n',sim.t);
+    next_t_print = next_t_print+1;
+  end
+
+  sim = ctrl_sim(sim);
 
   % store history
   hist_log.state(hist_log.state_idx,:) = [sim.motor_state' sim.t];
   hist_log.state_idx+=1;
-  hist_log.pwm(hist_log.pwm_idx,:) = [sim.ctrl.coarse sim.ctrl.fine sim.t];
-  hist_log.pwm_idx += 1;
   % allocate more storage if necessary
   if hist_log.state_idx >= length(hist_log.state)
     hist_log.state(hist_log.state_idx*2,:) = 0;
   end
-  if hist_log.pwm_idx >= length(hist_log.pwm)
-    hist_log.pwm(hist_log.pwm_idx*2,:) = 0;
-  end
   if sim.tick ~= 0
     hist_log.tick(hist_log.tick_idx,:) = [[sim.t2t_time_true sim.t2t_time]*sim.fpga_clk sim.t];
     hist_log.tick_idx += 1;
+    hist_log.pid(hist_log.pid_idx,:) = [sim.ctrl.ePID' sim.t];
+    hist_log.pid_idx += 1;
+    hist_log.pwm(hist_log.pwm_idx,:) = [sim.ctrl.coarse sim.ctrl.fine sim.t];
+    hist_log.pwm_idx += 1;
     if hist_log.tick_idx >= length(hist_log.tick)
       hist_log.tick(hist_log.tick_idx*2,:) = 0;
     end
-  end
-
-  sim = ctrl_sim(sim);
-  if sim.tick ~= 0
-    hist_log.pid(hist_log.pid_idx,:) = [sim.ctrl.ePID' sim.t];
-    hist_log.pid_idx += 1;
     if hist_log.pid_idx >= length(hist_log.pid)
       hist_log.pid(hist_log.pid_idx*2,:) = 0;
+    end
+    if hist_log.pwm_idx >= length(hist_log.pwm)
+      hist_log.pwm(hist_log.pwm_idx*2,:) = 0;
     end
   end
 end
@@ -83,8 +86,13 @@ hist_log.pwm   = hist_log.pwm(1:hist_log.pwm_idx-1,:);
 
 figure;
 % plot spin rate vs time
+subplot(211);
 plot(hist_log.state(:,end),hist_log.state(:,2)/2/pi);ylabel('Hz');
 title('spin rate');
+% plot current vs time
+subplot(212);
+plot(hist_log.state(:,end),hist_log.state(:,1)*1e3);ylabel('mA');
+title('motor current');
 
 figure;
 % plot tick data vs time, starting with second spin
@@ -105,7 +113,7 @@ title('D');
 
 figure;
 subplot(211);
-plot(hist_log.state(:,end),hist_log.pwm(:,1));ylabel('coarse');
+plot(hist_log.pwm(:,end),hist_log.pwm(:,1));ylabel('coarse');
 subplot(212);
 plot(hist_log.pwm(:,end),hist_log.pwm(:,2));ylabel('fine');
 return
@@ -142,8 +150,9 @@ ctrl = struct('set_speed_hz',set_speed_hz,...
               'kPID_pll',kPID_pll,...
               'ePID',[0;0;0],...
               'fsm_state',0,...
-              'accel_sec',5,...
-              'fine_threshold',1000);
+              'accel_sec',2,...
+              'fine_threshold',1000,...
+              'cal_tick_clk',[]); % expected encoder ticks in fpga clocks
 return
 
 function sim=init_sim(dt,end_t,mp,ep,ctrl,fc)
@@ -158,7 +167,6 @@ sim = struct('dt',dt,...                   simulation timestep
              'cal_ticks',[],...            simulated calibration tick locations
              'cal_ticks_rad',[],...        same as above, but in radians
              't',0,...                     current simulation time
-             'next_t_print',0,...          next time to print sim status
              't_clk',0,...                 current sumlation time in units of fpga clocks
              'tick', 0,...                 index of tick we just saw, or 0 for invalid
              'last_tick_time', 0,...       measured time of the last tick
@@ -177,6 +185,8 @@ sim.cal_ticks = sim.cal_ticks / sum(sim.cal_ticks);
 sim.cal_ticks_rad = sim.cal_ticks*2*pi;
 
 sim.next_tick_rad = sim.truth_ticks_rad(sim.next_tick_idx);
+
+sim.ctrl.cal_tick_clk = sim.cal_ticks * sim.fpga_clk / sim.ctrl.set_speed_hz;
 return
 
 function sim=prop_sim(sim)
@@ -190,10 +200,6 @@ end
 
 % propagate current time
 sim.t = sim.t+sim.dt;
-if sim.t >= sim.next_t_print
-  fprintf('t=%.0f\n',sim.t);
-  sim.next_t_print = sim.next_t_print+1;
-end
 % current time in units of fpga clocks
 sim.t_clk = sim.t*sim.fpga_clk;
 ctrl = [pwm2V(sim.ctrl.coarse,sim.ctrl.fine);sim.ctrl.Tl]; % voltage V, mechanical load
@@ -238,7 +244,7 @@ switch sim.ctrl.fsm_state
   case 1 %fll
     if sim.tick
       % error signal is difference between the measured t2t and what it should be
-      err = sim.cal_ticks(sim.tick)-sim.t2t_time*sim.fpga_clk;
+      err = sim.ctrl.cal_tick_clk(sim.tick)-sim.t2t_time*sim.fpga_clk;
       if abs(err) < sim.ctrl.stable_threshold
         sim.ctrl.stable_cnt += 1;
       else
