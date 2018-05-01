@@ -18,11 +18,12 @@ stable_threshold = 300;
 
 ctrl = init_ctrl(set_speed_hz,      %
                  stable_threshold,  %
-                 [1e-3;0;0],        % coarse PID gains
+                 [1e-3;0;0],
+                 %[3e-2;5e-5;1.5e0], % coarse PID gains. Ku = 3e-2, Tu = 0.35 -> Kp = 0.6Ku = 1.8e-2; Ki = 1.2Ku/Tu = 0.1 -> 5e-5; Kd = 3KuTu/40 = 7.9e-4 -> 1.5
                  [1e-2;1e-6;1e-2],  % fine PID gains
                  0.0);              % load torque
 
-sim = init_sim(1e-4,       % simulation timestep, sec
+sim = init_sim(5e-4,       % simulation timestep, sec
                5,          % simulation duration, sec
                mp,         % motor parameters
                ep,         % encoder parameters
@@ -33,24 +34,39 @@ sim = init_sim(1e-4,       % simulation timestep, sec
 %cal_ticks = cal_encoder*fpga_clock/set_speed_hz;
 
 hist_log = struct('state',zeros(floor(sim.end_t/sim.dt),3+1),... [current, rate, pos]
-              'state_idx',1,...
-              'tick',zeros(floor(sim.end_t*sim.ctrl.set_speed_hz*sim.ep.num_ticks),2+1),... [truth, meas]
-              'tick_idx',1,...
-              'pid',zeros(floor(sim.end_t*sim.ctrl.set_speed_hz*sim.ep.num_ticks),3+1),... [P, I, D]
-              'pid_idx',1,...
-              'pwm',zeros(floor(sim.end_t*sim.ctrl.set_speed_hz*sim.ep.num_ticks),2+1),... [coarse, fine]
-              'pwm_idx',1);
+                  'state_idx',1,...
+                  'tick',zeros(floor(sim.end_t*sim.ctrl.set_speed_hz*sim.ep.num_ticks),2+1),... [truth, meas]
+                  'tick_idx',1,...
+                  'pid',zeros(floor(sim.end_t*sim.ctrl.set_speed_hz*sim.ep.num_ticks),3+1),... [P, I, D]
+                  'pid_idx',1,...
+                  'pwm',zeros(floor(sim.end_t*sim.ctrl.set_speed_hz*sim.ep.num_ticks),2+1),... [coarse, fine]
+                  'pwm_idx',1,
+                  'ctrl',zeros(floor(sim.end_t*sim.ctrl.set_speed_hz),2+1),... [speed, ??]
+                  'ctrl_idx',1);
 
 next_t_print = 0; % next time to print sim status
 while sim.t < sim.end_t
 
   sim = prop_sim(sim);
   if sim.t >= next_t_print
-    fprintf('t=%.0f\n',sim.t);
-    next_t_print = next_t_print+1;
+    fprintf('t=%.1f\n',sim.t);
+    next_t_print = next_t_print+0.5;
+    fflush(stdout);
   end
 
   sim = ctrl_sim(sim);
+  
+  if sim.ctrl.fsm_state >= 1 && sim.ctrl.tick_buf_idx == 0 && sim.tick
+    t = sum(sim.ctrl.tick_buf);
+    if t > 0
+      hist_log.ctrl(hist_log.ctrl_idx,1) = sim.fpga_clk / sum(sim.ctrl.tick_buf);
+      hist_log.ctrl(hist_log.ctrl_idx,end) = sim.t;
+      hist_log.ctrl_idx += 1;
+      if hist_log.ctrl_idx >= length(hist_log.ctrl)
+        hist_log.ctrl(hist_log.ctrl_idx*2,:) = 0;
+      end
+    end
+  end
 
   % store history
   hist_log.state(hist_log.state_idx,:) = [sim.motor_state' sim.t];
@@ -83,6 +99,7 @@ hist_log.state = hist_log.state(1:hist_log.state_idx-1,:);
 hist_log.tick  = hist_log.tick(1:hist_log.tick_idx-1,:);
 hist_log.pid   = hist_log.pid(1:hist_log.pid_idx-1,:);
 hist_log.pwm   = hist_log.pwm(1:hist_log.pwm_idx-1,:);
+hist_log.ctrl  = hist_log.ctrl(1:hist_log.ctrl_idx-1,:);
 
 figure;
 % plot spin rate vs time
@@ -116,25 +133,12 @@ subplot(211);
 plot(hist_log.pwm(:,end),hist_log.pwm(:,1));ylabel('coarse');
 subplot(212);
 plot(hist_log.pwm(:,end),hist_log.pwm(:,2));ylabel('fine');
+
+figure;
+plot(hist_log.state(:,end),hist_log.state(:,2)/2/pi,hist_log.ctrl(:,end),hist_log.ctrl(:,1));ylabel('Hz');
+legend('true speed', 'measured speed');
 return
 
-
-function mp=motor_params(tc,ri,dc,er,ei,vc,cn,vn)
-mp = struct('tc',tc,... torque constant
-            'ri',ri,... rotor inertia
-            'dc',dc,... damping coefficient
-            'er',er,... equivalent resistance [Ohm]
-            'ei',ei,... equivalent inductance [H]
-            'vc',vc,... velocity constant
-            'cn',cn,... current noise
-            'vn',vn); % velocity noise
-return
-
-function ep=encoder_params(ce,te,nt)
-ep = struct('ce',ce,... calibration error, frac of circle
-            'te',te,... encoder tick edge error, sec
-            'num_ticks',nt); % number of encoder ticks
-return
 
 function ctrl=init_ctrl(set_speed_hz,
                         stable_threshold,
@@ -152,6 +156,8 @@ ctrl = struct('set_speed_hz',set_speed_hz,...
               'fsm_state',0,...
               'accel_sec',2,...
               'fine_threshold',1000,...
+              'tick_buf',[],...
+              'tick_buf_idx',0,...
               'cal_tick_clk',[]); % expected encoder ticks in fpga clocks
 return
 
@@ -223,9 +229,13 @@ if sim.motor_state(3) >= sim.next_tick_rad
   sim.tick_age = (sim.motor_state(3)-sim.this_tick_rad)/sim.motor_state(2);
   
   sim.tick_time_true = sim.t-sim.tick_age;
+  sim.tick_time_true_clk = sim.tick_time_true * sim.fpga_clk;
   sim.tick_time = sim.tick_time_true+randn(1)*sim.ep.te;
+  sim.tick_time_clk = sim.tick_time * sim.fpga_clk;
   sim.t2t_time_true = sim.tick_time_true-sim.last_tick_time_true;
+  sim.t2t_time_true_clk = sim.t2t_time_true * sim.fpga_clk;
   sim.t2t_time = sim.tick_time-sim.last_tick_time;
+  sim.t2t_time_clk = sim.t2t_time * sim.fpga_clk;
 end
 
 return
@@ -243,8 +253,14 @@ switch sim.ctrl.fsm_state
     end
   case 1 %fll
     if sim.tick
+      sim.ctrl.tick_buf(sim.ctrl.tick_buf_idx + 1) = sim.t2t_time_clk;
+      sim.ctrl.tick_buf_idx += 1;
+      if sim.ctrl.tick_buf_idx >= sim.ep.num_ticks
+        sim.ctrl.tick_buf_idx = 0;
+      end
       % error signal is difference between the measured t2t and what it should be
-      err = sim.ctrl.cal_tick_clk(sim.tick)-sim.t2t_time*sim.fpga_clk;
+      err = sim.ctrl.cal_tick_clk(sim.tick)-sim.t2t_time_clk;
+      %fprintf('%.0f %.0f\n', sim.ctrl.cal_tick_clk(sim.tick), sim.t2t_time_clk);
       if abs(err) < sim.ctrl.stable_threshold
         sim.ctrl.stable_cnt += 1;
       else
@@ -257,12 +273,18 @@ switch sim.ctrl.fsm_state
       end
       sig = sim.ctrl.kPID_fll'*sim.ctrl.ePID;
       sim.ctrl.coarse = sim.ctrl.coarse-sig;
+      if sim.ctrl.coarse > 4095
+        sim.ctrl.coarse = 4095;
+      end
+      if sim.ctrl.coarse < 0
+        sim.ctrl.coarse = 0;
+      end
 
       if sim.ctrl.stable_cnt >= sim.ctrl.fine_threshold
         sim.ctrl.fsm_state = 2;
         % latch the phase error when we switch to pll, want to maintain this
         % phase error is: measured phase of this tick - desired phase of this tick
-        sim.ctrl.latched_phase = sim.this_tick_rad-sim.tick_time
+        sim.ctrl.latched_phase = sim.this_tick_rad-sim.tick_time;
       end
     end
   case 2 %pll
